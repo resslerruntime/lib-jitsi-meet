@@ -341,7 +341,9 @@ export default class JingleSessionPC extends JingleSession {
                     || (browser.isChromiumBased()
 
                         // Provide a way to control the behavior for jvb and p2p connections independently.
-                        && this.isP2P ? options.p2p?.enableUnifiedOnChrome : options.enableUnifiedOnChrome));
+                        && this.isP2P
+                        ? options.p2p?.enableUnifiedOnChrome ?? true
+                        : options.enableUnifiedOnChrome ?? true));
 
         if (this.isP2P) {
             // simulcast needs to be disabled for P2P (121) calls
@@ -990,7 +992,7 @@ export default class JingleSessionPC extends JingleSession {
             init,
             this.isInitiator ? 'initiator' : 'responder');
         init = init.tree();
-        logger.info(`${this} Session-initiate: `, init);
+        logger.debug(`${this} Session-initiate: `, init);
         this.connection.sendIQ(init,
             () => {
                 logger.info(`${this} Got RESULT for "session-initiate"`);
@@ -1013,6 +1015,17 @@ export default class JingleSessionPC extends JingleSession {
             jingleAnswer,
             () => {
                 logger.info(`${this} setAnswer - succeeded`);
+                if (this.usesUnifiedPlan && browser.isChromiumBased()) {
+                    // This hack is needed for Chrome to create a decoder for the ssrcs in the remote SDP when
+                    // the local endpoint is the offerer and starts muted.
+                    const remoteSdp = this.peerconnection.remoteDescription.sdp;
+                    const remoteDescription = new RTCSessionDescription({
+                        type: 'offer',
+                        sdp: remoteSdp
+                    });
+
+                    this._responderRenegotiate(remoteDescription);
+                }
             },
             error => {
                 logger.error(`${this} setAnswer failed: `, error);
@@ -1235,7 +1248,7 @@ export default class JingleSessionPC extends JingleSession {
         // NOTE: since we're just reading from it, we don't need to be within
         //  the modification queue to access the local description
         const localSDP = new SDP(this.peerconnection.localDescription.sdp);
-        let accept = $iq({ to: this.remoteJid,
+        const accept = $iq({ to: this.remoteJid,
             type: 'set' })
             .c('jingle', { xmlns: 'urn:xmpp:jingle:1',
                 action: 'session-accept',
@@ -1256,9 +1269,8 @@ export default class JingleSessionPC extends JingleSession {
             accept,
             this.initiatorJid === this.localJid ? 'initiator' : 'responder');
 
-        // Calling tree() to print something useful
-        accept = accept.tree();
-        logger.info(`${this} Sending session-accept`, accept);
+        logger.info(`${this} Sending session-accept`);
+        logger.debug(accept.tree());
         this.connection.sendIQ(accept,
             success,
             this.newJingleErrorHandler(accept, error => {
@@ -1324,6 +1336,7 @@ export default class JingleSessionPC extends JingleSession {
         }
 
         logger.info(`${this} sending content-modify, video senders: ${senders}, max frame height: ${maxFrameHeight}`);
+        logger.debug(sessionModify.tree());
 
         this.connection.sendIQ(
             sessionModify,
@@ -1365,7 +1378,7 @@ export default class JingleSessionPC extends JingleSession {
      * @private
      */
     sendTransportAccept(localSDP, success, failure) {
-        let transportAccept = $iq({ to: this.remoteJid,
+        const transportAccept = $iq({ to: this.remoteJid,
             type: 'set' })
             .c('jingle', {
                 xmlns: 'urn:xmpp:jingle:1',
@@ -1390,9 +1403,8 @@ export default class JingleSessionPC extends JingleSession {
             transportAccept.up();
         });
 
-        // Calling tree() to print something useful to the logger
-        transportAccept = transportAccept.tree();
-        logger.info(`${this} Sending transport-accept: `, transportAccept);
+        logger.info(`${this} Sending transport-accept`);
+        logger.debug(transportAccept.tree());
 
         this.connection.sendIQ(transportAccept,
             success,
@@ -1414,7 +1426,7 @@ export default class JingleSessionPC extends JingleSession {
     sendTransportReject(success, failure) {
         // Send 'transport-reject', so that the focus will
         // know that we've failed
-        let transportReject = $iq({ to: this.remoteJid,
+        const transportReject = $iq({ to: this.remoteJid,
             type: 'set' })
             .c('jingle', {
                 xmlns: 'urn:xmpp:jingle:1',
@@ -1423,8 +1435,8 @@ export default class JingleSessionPC extends JingleSession {
                 sid: this.sid
             });
 
-        transportReject = transportReject.tree();
-        logger.info(`${this} Sending 'transport-reject'`, transportReject);
+        logger.info(`${this} Sending 'transport-reject'`);
+        logger.debug(transportReject.tree());
 
         this.connection.sendIQ(transportReject,
             success,
@@ -1493,7 +1505,7 @@ export default class JingleSessionPC extends JingleSession {
         }
 
         if (!options || Boolean(options.sendSessionTerminate)) {
-            let sessionTerminate
+            const sessionTerminate
                 = $iq({
                     to: this.remoteJid,
                     type: 'set'
@@ -1526,9 +1538,9 @@ export default class JingleSessionPC extends JingleSession {
                         restart: options && options.requestRestart === true
                     }).up();
 
-            // Calling tree() to print something useful
-            sessionTerminate = sessionTerminate.tree();
-            logger.info(`${this} Sending session-terminate`, sessionTerminate);
+            logger.info(`${this} Sending session-terminate`);
+            logger.debug(sessionTerminate.tree());
+
             this.connection.sendIQ(
                 sessionTerminate,
                 success,
@@ -1609,7 +1621,7 @@ export default class JingleSessionPC extends JingleSession {
                             })
                             .get();
 
-                    if (ssrcs.length && !currentRemoteSdp.containsSSRC(ssrcs[0])) {
+                    if (ssrcs.length) {
                         lines += `a=ssrc-group:${semantics} ${ssrcs.join(' ')}\r\n`;
                     }
                 });
@@ -1760,18 +1772,29 @@ export default class JingleSessionPC extends JingleSession {
                     ? this._processRemoteAddSource(addOrRemoveSsrcInfo)
                     : this._processRemoteRemoveSource(addOrRemoveSsrcInfo);
 
-            this._renegotiate(newRemoteSdp.raw)
-                .then(() => {
-                    const newLocalSdp
-                        = new SDP(this.peerconnection.localDescription.sdp);
+            // Add a workaround for a bug in Chrome (unified plan) for p2p connection. When the media direction on
+            // the transceiver goes from "inactive" (both users join muted) to "recvonly" (peer unmutes), the browser
+            // doesn't seem to create a decoder if the signaling state changes from "have-local-offer" to "stable".
+            // Therefore, initiate a responder renegotiate even if the endpoint is the offerer to workaround this issue.
+            // TODO - open a chrome bug and update the comments.
+            const remoteDescription = new RTCSessionDescription({
+                type: 'offer',
+                sdp: newRemoteSdp.raw
+            });
+            const promise = isAdd && this.usesUnifiedPlan && this.isP2P && browser.isChromiumBased()
+                ? this._responderRenegotiate(remoteDescription)
+                : this._renegotiate(newRemoteSdp.raw);
 
-                    logger.log(`${this} ${logPrefix} - OK`);
-                    this.notifyMySSRCUpdate(oldLocalSdp, newLocalSdp);
-                    finishedCallback();
-                }, error => {
-                    logger.error(`${this} ${logPrefix} failed:`, error);
-                    finishedCallback(error);
-                });
+            promise.then(() => {
+                const newLocalSdp = new SDP(this.peerconnection.localDescription.sdp);
+
+                logger.log(`${this} ${logPrefix} - OK`);
+                this.notifyMySSRCUpdate(oldLocalSdp, newLocalSdp);
+                finishedCallback();
+            }, error => {
+                logger.error(`${this} ${logPrefix} failed:`, error);
+                finishedCallback(error);
+            });
         };
 
         logger.debug(`${this} Queued ${logPrefix} task`);
@@ -2497,7 +2520,8 @@ export default class JingleSessionPC extends JingleSession {
         const removedAnySSRCs = sdpDiffer.toJingle(remove);
 
         if (removedAnySSRCs) {
-            logger.info(`${this} Sending source-remove`, remove.tree());
+            logger.info(`${this} Sending source-remove`);
+            logger.debug(remove.tree());
             this.connection.sendIQ(
                 remove, null,
                 this.newJingleErrorHandler(remove), IQ_TIMEOUT);
@@ -2518,7 +2542,8 @@ export default class JingleSessionPC extends JingleSession {
         const containsNewSSRCs = sdpDiffer.toJingle(add);
 
         if (containsNewSSRCs) {
-            logger.info(`${this} Sending source-add`, add.tree());
+            logger.info(`${this} Sending source-add`);
+            logger.debug(add.tree());
             this.connection.sendIQ(
                 add, null, this.newJingleErrorHandler(add), IQ_TIMEOUT);
         }

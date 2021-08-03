@@ -132,7 +132,7 @@ export default class BrowserCapabilities extends BrowserDetection {
      */
     supportsCodecPreferences() {
         return Boolean(window.RTCRtpTransceiver
-            && typeof window.RTCRtpTransceiver.setCodecPreferences !== 'undefined'
+            && 'setCodecPreferences' in window.RTCRtpTransceiver.prototype
             && window.RTCRtpReceiver
             && typeof window.RTCRtpReceiver.getCapabilities !== 'undefined')
 
@@ -241,8 +241,7 @@ export default class BrowserCapabilities extends BrowserDetection {
      */
     supportsInsertableStreams() {
         if (!(typeof window.RTCRtpSender !== 'undefined'
-            && (window.RTCRtpSender.prototype.createEncodedStreams
-                || window.RTCRtpSender.prototype.createEncodedVideoStreams))) {
+            && window.RTCRtpSender.prototype.createEncodedStreams)) {
             return false;
         }
 
